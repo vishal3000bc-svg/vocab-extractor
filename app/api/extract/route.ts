@@ -1,84 +1,181 @@
-import express from 'express';
-import { GoogleCloudStorage } from '@google-cloud/storage';
-import { readFile } from 'fs/promises';
-import { PDFParser } from 'pdf2json';
-import * as docx from 'docx-parser';
-import Jimp from 'jimp';
-import { createClient } from '@google/maps';
+import { NextRequest, NextResponse } from 'next/server';
+import { GoogleGenerativeAI } from '@google/generative-ai';
+import pdfParse from 'pdf-parse';
+import { extractRawText } from 'mammoth';
 
-const router = express.Router();
-const storage = new GoogleCloudStorage();
+const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY || '');
 
-// Initialize Google Maps Client for Google AI services
-const googleMapsClient = createClient({
-  key: 'YOUR_API_KEY',
-  Promise: Promise
-});
+interface ExtractedData {
+    text: string;
+    metadata: {
+        fileName: string;
+        fileType: string;
+        extractedAt: string;
+    };
+    success: boolean;
+    error?: string;
+}
 
-// Function to process PDF files
-const processPDF = async (filePath: string) => {
-  return new Promise((resolve, reject) => {
-    const pdfParser = new PDFParser();
-
-    pdfParser.on('pdfParser_dataError', err => reject(err));
-    pdfParser.on('pdfParser_dataReady', pdfData => {
-      resolve(pdfData.formImage.Pages.map(page => page.Texts.map(text => text.R[0].T).join(' ')).join('\n'));
-    });
-
-    pdfParser.loadPDF(filePath);
-  });
+const SUPPORTED_TYPES: { [key: string]: string } = {
+    'application/pdf': 'pdf',
+    'application/msword': 'doc',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+    'image/png': 'image',
+    'image/jpeg': 'image',
+    'image/jpg': 'image',
+    'image/webp': 'image',
+    'text/plain': 'text',
 };
 
-// Function to process DOCX files
-const processDOCX = async (filePath: string) => {
-  return new Promise((resolve, reject) => {
-    docx.parseDocx(filePath, (err, data) => {
-      if (err) return reject(err);
-      resolve(data);
-    });
-  });
-};
-
-// Function to process images
-const processImage = async (filePath: string) => {
-  const text = await Jimp.read(filePath).then(image => {
-    return image.ocr();
-  });
-  return text;
-};
-
-// API route for document extraction
-router.post('/extract', async (req, res) => {
-  const { filePath, fileType } = req.body;
-
-  try {
-    let result;
-
-    switch (fileType) {
-      case 'pdf':
-        result = await processPDF(filePath);
-        break;
-      case 'docx':
-        result = await processDOCX(filePath);
-        break;
-      case 'image':
-        result = await processImage(filePath);
-        break;
-      case 'text':
-        result = await readFile(filePath, 'utf8');
-        break;
-      default:
-        return res.status(400).send('Unsupported file type');
+async function extractFromPDF(buffer: Buffer): Promise<string> {
+    try {
+        const data = await pdfParse(buffer);
+        return data.text || '';
+    } catch (error) {
+        throw new Error(`PDF extraction failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
+}
 
-    // Call Google Generative AI API (mock example)
-    const aiResponse = await googleMapsClient.textSearch({ query: result });
+async function extractFromDOCX(buffer: Buffer): Promise<string> {
+    try {
+        const result = await extractRawText({ buffer });
+        return result.value || '';
+    } catch (error) {
+        throw new Error(`DOCX extraction failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+}
 
-    res.json({ extractedText: result, aiResponse: aiResponse.json });
-  } catch (error) {
-    console.error(error);
-    res.status(500).send('Error processing the file');
-  }
-});
+async function extractFromImage(buffer: Buffer, mimeType: string): Promise<string> {
+    try {
+        const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+        const base64 = buffer.toString('base64');
+        const response = await model.generateContent([
+            {
+                inlineData: {
+                    data: base64,
+                    mimeType: mimeType as 'image/png' | 'image/jpeg' | 'image/webp',
+                },
+            },
+            {
+                text: 'Extract all visible text from this image. Be thorough and accurate.',
+            },
+        ]);
+        const textContent = response.content.parts[0];
+        if (textContent.type === 'text') {
+            return textContent.text;
+        }
+        throw new Error('No text content returned');
+    } catch (error) {
+        throw new Error(`Image extraction failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+}
 
-export default router;
+async function extractFromText(buffer: Buffer): Promise<string> {
+    try {
+        return buffer.toString('utf-8');
+    } catch (error) {
+        throw new Error(`Text extraction failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+}
+
+async function processFile(buffer: Buffer, fileName: string, mimeType: string): Promise<string> {
+    const fileType = SUPPORTED_TYPES[mimeType];
+    if (!fileType) {
+        throw new Error(`Unsupported file type: ${mimeType}`);
+    }
+    switch (fileType) {
+        case 'pdf':
+            return await extractFromPDF(buffer);
+        case 'docx':
+        case 'doc':
+            return await extractFromDOCX(buffer);
+        case 'image':
+            return await extractFromImage(buffer, mimeType);
+        case 'text':
+            return await extractFromText(buffer);
+        default:
+            throw new Error(`Unknown file type: ${fileType}`);
+    }
+}
+
+export async function POST(request: NextRequest): Promise<NextResponse<ExtractedData>> {
+    try {
+        if (!process.env.GOOGLE_API_KEY) {
+            return NextResponse.json(
+                {
+                    text: '',
+                    metadata: {
+                        fileName: '',
+                        fileType: '',
+                        extractedAt: new Date().toISOString(),
+                    },
+                    success: false,
+                    error: 'Google API key not configured',
+                },
+                { status: 500 }
+            );
+        }
+        const formData = await request.formData();
+        const file = formData.get('file') as File;
+        if (!file) {
+            return NextResponse.json(
+                {
+                    text: '',
+                    metadata: {
+                        fileName: '',
+                        fileType: '',
+                        extractedAt: new Date().toISOString(),
+                    },
+                    success: false,
+                    error: 'No file provided',
+                },
+                { status: 400 }
+            );
+        }
+        const MAX_FILE_SIZE = 25 * 1024 * 1024;
+        if (file.size > MAX_FILE_SIZE) {
+            return NextResponse.json(
+                {
+                    text: '',
+                    metadata: {
+                        fileName: file.name,
+                        fileType: file.type,
+                        extractedAt: new Date().toISOString(),
+                    },
+                    success: false,
+                    error: 'File size exceeds 25MB limit',
+                },
+                { status: 400 }
+            );
+        }
+        const buffer = Buffer.from(await file.arrayBuffer());
+        const extractedText = await processFile(buffer, file.name, file.type);
+        return NextResponse.json(
+            {
+                text: extractedText,
+                metadata: {
+                    fileName: file.name,
+                    fileType: file.type,
+                    extractedAt: new Date().toISOString(),
+                },
+                success: true,
+            },
+            { status: 200 }
+        );
+    } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+        return NextResponse.json(
+            {
+                text: '',
+                metadata: {
+                    fileName: '',
+                    fileType: '',
+                    extractedAt: new Date().toISOString(),
+                },
+                success: false,
+                error: errorMessage,
+            },
+            { status: 500 }
+        );
+    }
+}
